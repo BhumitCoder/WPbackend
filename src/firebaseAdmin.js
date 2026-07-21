@@ -3,7 +3,7 @@ import admin from "firebase-admin";
 // Same project + named database the AIM frontend itself uses — see
 // src/lib/firebase.ts (DATABASE_ID) and src/lib/teamAdmin.ts in the main app.
 // Must match exactly, or this writes into a database the app never looks at.
-const DATABASE_ID = "kinteshmobileacce";
+const DATABASE_ID = "omimpex";
 
 let dbInstance = null;
 
@@ -15,7 +15,7 @@ export function getDb() {
     if (!raw) {
       throw new Error(
         "FIREBASE_SERVICE_ACCOUNT_KEY is not set — add the Firebase Admin SDK service account " +
-          "JSON as an environment variable (see .env.example) before the WhatsApp session store can work.",
+        "JSON as an environment variable (see .env.example) before the WhatsApp session store can work.",
       );
     }
     const serviceAccount = JSON.parse(raw);
