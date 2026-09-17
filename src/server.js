@@ -22,13 +22,27 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true, status: wa.state.status }));
+// Unauthenticated on purpose — it is what an uptime pinger calls. It reports
+// why the service is not connected when there is a reason, because the
+// alternative is reading a host's log to find one line of cause under sixty
+// lines of gRPC stack.
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: !wa.state.lastError,
+    status: wa.state.status,
+    ...(wa.state.lastError ? { error: wa.state.lastError } : null),
+  }),
+);
 
 // Poll this from the AIM Settings > "Link WhatsApp" screen while status is
 // "qr", then stop once it flips to "connected".
 app.get("/qr", requireApiKey, (_req, res) => {
   if (wa.state.status === "connected") return res.json({ status: "connected", phone: wa.state.phone });
-  if (!wa.state.qrDataUrl) return res.json({ status: "waiting" });
+  // "Waiting" with a reason attached, so the Settings screen can stop spinning
+  // and say what is wrong instead of implying the QR is on its way.
+  if (!wa.state.qrDataUrl) {
+    return res.json({ status: "waiting", ...(wa.state.lastError ? { error: wa.state.lastError } : null) });
+  }
   res.json({ status: "qr", qr: wa.state.qrDataUrl });
 });
 
@@ -115,5 +129,5 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-wa.start();
+wa.startSafely();
 app.listen(PORT, () => console.log(`WhatsApp server listening on http://localhost:${PORT}`));

@@ -2,6 +2,7 @@ import P from "pino";
 import QRCode from "qrcode";
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
 import { useFirestoreAuthState, clearSession } from "./firestoreAuthState.js";
+import { DATABASE_ID, getProjectId } from "./firebaseAdmin.js";
 
 // receivedMessages is in-memory only (fine — it's a rolling recent-activity
 // log, not the source of truth). The WhatsApp session itself (creds.json +
@@ -14,6 +15,10 @@ export const state = {
   phone: null, // e.g. "919978581685" once connected
   receivedMessages: [],
   connectedAt: null,
+  // Why the service is not connected, in words, when there is a reason worth
+  // reporting. /health returns it, so the shop can see the cause without
+  // anyone reading a host's log.
+  lastError: null,
 };
 
 // Sending immediately after the socket has just (re)connected — the most
@@ -38,6 +43,71 @@ const PENDING_ACK_WARN_MS = 20000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Say what actually went wrong, in a sentence somebody can act on.
+ *
+ * The failure this was written for printed sixty lines of gRPC and
+ * OpenTelemetry stack frames and one useful token: `code: 5`. Firestore
+ * returns NOT_FOUND for a missing DATABASE, never for a missing document — a
+ * document that isn't there comes back as `exists: false`. So code 5 on the
+ * first read means the named database this service is pointed at does not
+ * exist in the project whose service account it was given, and the two were
+ * almost certainly taken from different shops.
+ */
+export function describeFailure(err) {
+  if (err?.code === 5) {
+    const project = getProjectId();
+    return (
+      `Firestore has no database named "${DATABASE_ID}"` +
+      (project ? ` in project "${project}"` : "") +
+      ". The database name and the service account must belong to the same shop — " +
+      "set FIRESTORE_DATABASE_ID to this project's database, or supply the service " +
+      "account for the project that owns that database."
+    );
+  }
+  if (err?.code === 7 || err?.code === 16) {
+    return (
+      `Firestore refused the service account (code ${err.code}). Check it has not been ` +
+      `revoked and that it is allowed to reach the database "${DATABASE_ID}".`
+    );
+  }
+  return err?.message || String(err);
+}
+
+/* Bringing the socket up depends on two things outside this process —
+   Firestore for the saved session, and WhatsApp for the protocol version — and
+   either can be down or misconfigured. Before this, a failure in start() was an
+   unhandled rejection, which Node turns into an exit, which the host turns into
+   a restart, which fails identically: the service crash-looped and the reason
+   scrolled past inside a stack trace. Now it backs off and keeps the HTTP
+   server up, so /health can say why. */
+const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 60000;
+let retryAttempt = 0;
+let startInFlight = false;
+
+/** The only way this module should be started or restarted. */
+export function startSafely(reason = "startup") {
+  if (startInFlight) return;
+  startInFlight = true;
+  start()
+    .then(() => {
+      retryAttempt = 0;
+      state.lastError = null;
+    })
+    .catch((err) => {
+      state.lastError = describeFailure(err);
+      const wait = Math.min(RETRY_BASE_MS * 2 ** retryAttempt, RETRY_MAX_MS);
+      retryAttempt += 1;
+      console.error(`[whatsapp] could not start (${reason}): ${state.lastError}`);
+      console.error(`[whatsapp] retrying in ${Math.round(wait / 1000)}s (attempt ${retryAttempt})`);
+      setTimeout(() => startSafely("retry"), wait).unref?.();
+    })
+    .finally(() => {
+      startInFlight = false;
+    });
 }
 
 function phoneFromJid(jid) {
@@ -111,14 +181,14 @@ export async function start() {
       if (manualDisconnectInFlight) {
         // disconnect() below already owns clearSession + restart for this case.
       } else if (!loggedOut) {
-        start();
+        startSafely("reconnect");
       } else {
         // The phone's own "Linked Devices > Remove" was used, bypassing our
         // /disconnect route — stale creds are now invalid, so wipe them and
         // reconnect fresh so the Settings page has a new QR ready to go.
         clearSession()
           .catch((err) => console.error("[whatsapp] clearSession failed:", err))
-          .finally(() => start());
+          .finally(() => startSafely("logged-out"));
       }
     }
   });
@@ -178,7 +248,10 @@ export async function disconnect() {
       }
     }
     await clearSession();
-    await start();
+    // Best effort, and deliberately not awaited: the logout itself has already
+    // succeeded by here, and if bringing a fresh socket up fails then the retry
+    // loop is the right place for that — not a 500 on a request that did its job.
+    startSafely("after-disconnect");
   } finally {
     manualDisconnectInFlight = false;
   }
